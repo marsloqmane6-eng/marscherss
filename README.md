@@ -4,7 +4,7 @@ MarsChess is a self-contained, Mars-themed chess site with:
 
 - Ten local Stockfish bot levels from 400 to 3200 Elo, with Martian 3200 as the default.
 - An optional switchable AI brain for bot games using any OpenAI-compatible chat-completions endpoint and API key.
-- Username/password accounts stored in SQLite.
+- Username/password accounts stored in PostgreSQL in production, with SQLite for local development.
 - Rated human-vs-human matchmaking with server-authoritative clocks.
 - Live chat, draw offers, resignations, and aborts.
 - A post-game review with accuracy, move classifications, an evaluation graph, best moves, and key moments.
@@ -14,9 +14,9 @@ The legacy MarsPass C++ project at the repository root is untouched. This websit
 
 ## Requirements
 
-- Node.js 24 or newer. The server uses the built-in `node:sqlite` module.
-- No npm packages are required.
-- A browser with JavaScript and EventSource support.
+- Node.js 22 or newer. Local development uses the built-in `node:sqlite` module.
+- PostgreSQL for production (`DATABASE_URL`), or SQLite with no setup for local development.
+- A modern browser with JavaScript enabled.
 - The Stockfish 10 JavaScript worker is bundled at `public/stockfish.js`, so bots and game review work without an internet connection.
 
 ## Start
@@ -41,9 +41,19 @@ Optional environment variables:
 | --- | --- | --- |
 | `PORT` | `3000` | HTTP port |
 | `HOST` | `0.0.0.0` | Bind address |
-| `DB_PATH` | `./data/marscherss.db` | SQLite database file path |
+| `DB_PATH` | `./data/marscherss.db` | SQLite database file path when `DATABASE_URL` is unset |
+| `DATABASE_URL` | empty | PostgreSQL connection string; enables production mode |
 
-The SQLite database is created automatically at `data/marscherss.db`.
+The SQLite database is created automatically at `data/marscherss.db`. When `DATABASE_URL` is set, the PostgreSQL schema is created automatically too.
+
+## Deploy on Netlify
+
+The checked-in `netlify.toml` publishes `public/` and runs the API through `netlify/functions/api.js`.
+
+1. Create a Netlify site from this repository.
+2. Add `DATABASE_URL` in **Site configuration → Environment variables**.
+3. Deploy. The API function uses short polling rather than SSE, so matchmaking and live games work within Netlify's request model.
+4. Add `marscherss.is-a.dev` as a custom domain and create the matching CNAME at is-a.dev.
 
 ## Play online against a human
 
@@ -73,7 +83,9 @@ The key is stored in this browser's local settings, never sent to the MarsChess 
 
 ```
 marscherss/
-  server.js          zero-dependency HTTP server, SQLite schema, auth, SSE, matchmaking
+  server.js          HTTP server, database layer, auth, matchmaking, game API
+  netlify.toml       Netlify static hosting and API redirects
+  netlify/functions/ Netlify serverless adapter for the API
   package.json
   public/
     index.html       SPA shell
@@ -84,7 +96,7 @@ marscherss/
     board.js         board renderer, arrows, Stockfish worker wrapper
     pages.js         home, auth, leaderboard, account, learn routes
     bot.js           bot arena, levels, clocks, hints, undo, AI brain
-    online.js        lobby, matchmaking, SSE games, clocks, chat
+    online.js        lobby, matchmaking, polling games, clocks, chat
     review.js        game review analysis and UI
     stockfish.js     bundled Stockfish 10 worker (GPL-3.0)
     stockfish-LICENSE.txt  full GPL-3.0 license text

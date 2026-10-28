@@ -11,7 +11,6 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { promisify } = require('node:util');
-const { DatabaseSync } = require('node:sqlite');
 const { Pool } = require('pg');
 const Engine = require('./public/engine.js');
 
@@ -30,7 +29,9 @@ const MAX_BODY = 32 * 1024;
 
 let sqlite = null;
 let pool = null;
+let DatabaseSync = null;
 let sqliteWriteQueue = Promise.resolve();
+let dbReady = null;
 
 const SQLITE_SCHEMA = `
   CREATE TABLE IF NOT EXISTS users (
@@ -91,12 +92,20 @@ const SQLITE_SCHEMA = `
     created_at INTEGER NOT NULL
   );
 
+  CREATE TABLE IF NOT EXISTS queue (
+    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    time_control TEXT NOT NULL,
+    rating INTEGER NOT NULL,
+    joined_at INTEGER NOT NULL
+  );
+
   CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
   CREATE INDEX IF NOT EXISTS idx_games_active ON games(status, updated_at);
   CREATE INDEX IF NOT EXISTS idx_games_white ON games(white_id, status);
   CREATE INDEX IF NOT EXISTS idx_games_black ON games(black_id, status);
   CREATE INDEX IF NOT EXISTS idx_moves_game ON moves(game_id, ply);
   CREATE INDEX IF NOT EXISTS idx_chat_game ON chat(game_id, id);
+  CREATE INDEX IF NOT EXISTS idx_queue_tc ON queue(time_control, joined_at);
 `;
 
 const PG_SCHEMA = `
@@ -160,12 +169,20 @@ const PG_SCHEMA = `
     created_at BIGINT NOT NULL
   );
 
+  CREATE TABLE IF NOT EXISTS queue (
+    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    time_control TEXT NOT NULL,
+    rating INTEGER NOT NULL,
+    joined_at BIGINT NOT NULL
+  );
+
   CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
   CREATE INDEX IF NOT EXISTS idx_games_active ON games(status, updated_at);
   CREATE INDEX IF NOT EXISTS idx_games_white ON games(white_id, status);
   CREATE INDEX IF NOT EXISTS idx_games_black ON games(black_id, status);
   CREATE INDEX IF NOT EXISTS idx_moves_game ON moves(game_id, ply);
   CREATE INDEX IF NOT EXISTS idx_chat_game ON chat(game_id, id);
+  CREATE INDEX IF NOT EXISTS idx_queue_tc ON queue(time_control, joined_at);
 `;
 
 function toPgSql(sql) {
@@ -293,12 +310,24 @@ async function initDb() {
     await pool.query(PG_SCHEMA);
     console.log('Database: PostgreSQL');
   } else {
+    if (!DatabaseSync) DatabaseSync = require('node:sqlite').DatabaseSync;
     fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
     sqlite = new DatabaseSync(DB_PATH);
     sqlite.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
     sqlite.exec(SQLITE_SCHEMA);
     console.log('Database:', DB_PATH);
   }
+}
+
+// Serverless instances are reused, so initialize the schema once per process.
+function ensureDb() {
+  if (!dbReady) {
+    dbReady = initDb().catch((err) => {
+      dbReady = null;
+      throw err;
+    });
+  }
+  return dbReady;
 }
 
 async function closeDb() {
@@ -512,8 +541,6 @@ function clearRateLimit(key) {
 // ---------------------------------------------------------------------------
 
 const sseClients = new Map(); // userId -> Set<ServerResponse>
-const queues = new Map(); // timeControl -> [{ userId, rating, joinedAt }]
-const queueByUser = new Map(); // userId -> timeControl
 
 function sseSend(res, event, data) {
   if (!res || res.writableEnded) return;
@@ -565,8 +592,8 @@ async function handleSse(req, res, user) {
   sseSend(res, 'online_count', { count: onlineCount() });
   broadcastOnlineCount();
 
-  const queuedTc = queueByUser.get(userId);
-  if (queuedTc) sseSend(res, 'queued', queueStatus(userId, queuedTc));
+  const queuedRow = await dbGet('SELECT time_control FROM queue WHERE user_id = ?', userId);
+  if (queuedRow) sseSend(res, 'queued', await queueStatus(userId, queuedRow.time_control));
 
   const active = await getActiveGameId(userId);
   if (active) {
@@ -585,8 +612,8 @@ async function handleSse(req, res, user) {
     if (clients.size > 0) return;
     sseClients.delete(userId);
     broadcastOnlineCount();
-    const tc = queueByUser.get(userId);
-    if (tc) removeFromQueue(userId, false);
+    const queued = await dbGet('SELECT time_control FROM queue WHERE user_id = ?', userId);
+    if (queued) await removeFromQueue(userId, false);
     const gameId = await getActiveGameId(userId);
     if (gameId) {
       const game = await getGame(gameId);
@@ -600,20 +627,6 @@ async function handleSse(req, res, user) {
   req.on('close', onClose);
   req.on('error', onClose);
 }
-
-// Heartbeat keeps proxies and browsers from dropping idle SSE streams.
-setInterval(() => {
-  for (const set of sseClients.values()) {
-    for (const res of set) {
-      if (!res.writableEnded) res.write(': ping\n\n');
-    }
-  }
-}, 15_000).unref();
-
-// Expired session cleanup.
-setInterval(() => {
-  dbRun('DELETE FROM sessions WHERE expires_at <= ?', now()).catch(() => {});
-}, 60 * 60 * 1000).unref();
 
 // ---------------------------------------------------------------------------
 // Game helpers
@@ -806,116 +819,131 @@ async function detectGameEnd(gameId, state) {
   return null;
 }
 
-async function createGameRecord(whiteId, blackId, tc) {
+async function createGameRecord(whiteId, blackId, tc, tx) {
   const cfg = parseTimeControl(tc);
   if (!cfg) throw new Error('Invalid time control');
   const fen = Engine.toFEN(Engine.initialState());
   const t = now();
-  return dbInsert(`
+  const sql = `
     INSERT INTO games (white_id, black_id, status, reason, fen, turn, time_control,
       base_ms, inc_ms, white_ms, black_ms, last_move_at, created_at, updated_at)
     VALUES (?, ?, 'active', '', ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
-  `, Number(whiteId), Number(blackId), fen, tc, cfg.baseMs, cfg.incMs, cfg.baseMs, cfg.baseMs, t, t, t);
+  `;
+  const params = [Number(whiteId), Number(blackId), fen, tc, cfg.baseMs, cfg.incMs, cfg.baseMs, cfg.baseMs, t, t, t];
+  if (tx) return tx.insert(sql, ...params);
+  return dbInsert(sql, ...params);
 }
 
 // ---------------------------------------------------------------------------
 // Matchmaking
 // ---------------------------------------------------------------------------
 
-function queueStatus(userId, tc) {
-  const queue = queues.get(tc);
-  if (!queue) return { queued: false, online: onlineCount() };
-  const idx = queue.findIndex(q => q.userId === Number(userId));
-  if (idx < 0) return { queued: false, online: onlineCount() };
+// The queue lives in the database so matchmaking works across serverless
+// instances. Position and waiting time are derived from the joined_at values.
+async function queueStatus(userId, tc) {
+  const row = await dbGet('SELECT time_control, joined_at FROM queue WHERE user_id = ?', Number(userId));
+  if (!row || row.time_control !== tc) return { queued: false, online: onlineCount() };
+  const before = await dbGet(`
+    SELECT COUNT(*) AS c FROM queue
+    WHERE time_control = ? AND joined_at <= ?
+  `, tc, Number(row.joined_at));
+  const total = await dbGet('SELECT COUNT(*) AS c FROM queue WHERE time_control = ?', tc);
   return {
     queued: true,
     timeControl: tc,
-    position: idx + 1,
-    queueLength: queue.length,
-    elapsedSeconds: Math.floor((now() - queue[idx].joinedAt) / 1000),
+    position: Number(before.c),
+    queueLength: Number(total.c),
+    elapsedSeconds: Math.floor((now() - Number(row.joined_at)) / 1000),
     online: onlineCount()
   };
 }
 
-function removeFromQueue(userId, notify) {
+async function removeFromQueue(userId, notify) {
   const id = Number(userId);
-  const tc = queueByUser.get(id);
-  if (!tc) return false;
-  queueByUser.delete(id);
-  const queue = queues.get(tc);
-  if (queue) {
-    const idx = queue.findIndex(q => q.userId === id);
-    if (idx >= 0) queue.splice(idx, 1);
-    if (!queue.length) queues.delete(tc);
-  }
-  if (notify) sendToUser(id, 'queue_cancelled', { timeControl: tc });
+  const row = await dbGet('SELECT time_control FROM queue WHERE user_id = ?', id);
+  if (!row) return false;
+  await dbRun('DELETE FROM queue WHERE user_id = ?', id);
+  if (notify) sendToUser(id, 'queue_cancelled', { timeControl: row.time_control });
   return true;
 }
 
 async function tryMatch(tc) {
-  const queue = queues.get(tc);
-  if (!queue || queue.length < 2) return;
-  let matched = false;
-  for (let i = 0; i < queue.length; i++) {
-    const a = queue[i];
-    if (!sseConnected(a.userId) || await getActiveGameId(a.userId)) {
-      queue.splice(i, 1); i--; continue;
+  if (!parseTimeControl(tc)) return false;
+  const t = now();
+  // Drop abandoned entries. A polling client refreshes last_seen every few
+  // seconds, so two minutes without activity means the tab is gone.
+  await dbRun(`
+    DELETE FROM queue
+    WHERE time_control = ? AND (
+      joined_at < ? OR user_id NOT IN (SELECT id FROM users WHERE last_seen >= ?)
+    )
+  `, tc, t - 5 * 60_000, t - 2 * 60_000);
+
+  const rows = await dbAll(`
+    SELECT q.user_id, q.rating, q.joined_at, u.last_seen
+    FROM queue q JOIN users u ON u.id = q.user_id
+    WHERE q.time_control = ? ORDER BY q.joined_at ASC
+  `, tc);
+  if (rows.length < 2) return false;
+
+  for (let i = 0; i < rows.length; i++) {
+    const a = rows[i];
+    if (await getActiveGameId(a.user_id)) {
+      await removeFromQueue(a.user_id, true);
+      continue;
     }
-    const waitA = now() - a.joinedAt;
-    const windowA = Math.min(1200, 200 + Math.floor(waitA / 10000) * 100);
-    let bestIndex = -1, bestDiff = Infinity;
-    for (let j = i + 1; j < queue.length; j++) {
-      const b = queue[j];
-      if (!sseConnected(b.userId) || await getActiveGameId(b.userId)) {
-        queue.splice(j, 1); j--; continue;
+    const waitA = t - Number(a.joined_at);
+    const windowA = Math.min(1200, 200 + Math.floor(waitA / 10_000) * 100);
+    let best = null;
+    let bestDiff = Infinity;
+    for (let j = i + 1; j < rows.length; j++) {
+      const b = rows[j];
+      if (await getActiveGameId(b.user_id)) {
+        await removeFromQueue(b.user_id, true);
+        continue;
       }
-      const waitB = now() - b.joinedAt;
-      const windowB = Math.min(1200, 200 + Math.floor(waitB / 10000) * 100);
-      const diff = Math.abs(a.rating - b.rating);
+      const waitB = t - Number(b.joined_at);
+      const windowB = Math.min(1200, 200 + Math.floor(waitB / 10_000) * 100);
+      const diff = Math.abs(Number(a.rating) - Number(b.rating));
       if (diff <= Math.max(windowA, windowB) && diff < bestDiff) {
         bestDiff = diff;
-        bestIndex = j;
+        best = b;
       }
     }
-    if (bestIndex >= 0) {
-      const b = queue[bestIndex];
-      queue.splice(bestIndex, 1);
-      queue.splice(i, 1);
-      queueByUser.delete(a.userId);
-      queueByUser.delete(b.userId);
-      const aWhite = crypto.randomInt(2) === 0;
-      const gameId = await createGameRecord(aWhite ? a.userId : b.userId, aWhite ? b.userId : a.userId, tc);
-      const game = await getGame(gameId);
-      sendToUser(a.userId, 'matched', { gameId, color: aWhite ? 'white' : 'black' });
-      sendToUser(b.userId, 'matched', { gameId, color: aWhite ? 'black' : 'white' });
-      pushGame(game);
-      matched = true;
-      i = -1;
-      if (queue.length < 2) break;
-    }
+    if (!best) continue;
+
+    const aWhite = crypto.randomInt(2) === 0;
+    const whiteId = aWhite ? a.user_id : best.user_id;
+    const blackId = aWhite ? best.user_id : a.user_id;
+    let gameId = null;
+    await withTransaction(async (tx) => {
+      const deleted = await tx.run('DELETE FROM queue WHERE user_id IN (?, ?)', Number(a.user_id), Number(best.user_id));
+      if (Number(deleted.changes) !== 2) return;
+      gameId = await createGameRecord(whiteId, blackId, tc, tx);
+    });
+    if (!gameId) return false;
+
+    const game = await getGame(gameId);
+    sendToUser(a.user_id, 'matched', { gameId, color: aWhite ? 'white' : 'black' });
+    sendToUser(best.user_id, 'matched', { gameId, color: aWhite ? 'black' : 'white' });
+    pushGame(game);
+    return true;
   }
-  if (!queue.length) queues.delete(tc);
-  if (!matched) {
-    for (const entry of queue) sendToUser(entry.userId, 'queued', queueStatus(entry.userId, tc));
-  }
+  return false;
 }
 
 async function joinQueue(userId, user, tc) {
   const id = Number(userId);
   if (!parseTimeControl(tc)) throw Object.assign(new Error('Unsupported time control.'), { status: 400 });
   if (await getActiveGameId(id)) throw Object.assign(new Error('You already have an active game.'), { status: 409 });
-  removeFromQueue(id, false);
-  let queue = queues.get(tc);
-  if (!queue) { queue = []; queues.set(tc, queue); }
-  if (!queue.some(q => q.userId === id)) {
-    queue.push({ userId: id, rating: Number(user.rating), joinedAt: now() });
-    queueByUser.set(id, tc);
-  }
-  sendToUser(id, 'queued', queueStatus(id, tc));
+  await removeFromQueue(id, false);
+  await dbRun('INSERT INTO queue (user_id, time_control, rating, joined_at) VALUES (?, ?, ?, ?)',
+    id, tc, Number(user.rating), now());
   await tryMatch(tc);
+  const row = await dbGet('SELECT time_control FROM queue WHERE user_id = ?', id);
   return {
-    queued: queueByUser.get(id) === tc,
-    queue: queueStatus(id, tc),
+    queued: Boolean(row && row.time_control === tc),
+    queue: row ? await queueStatus(id, row.time_control) : null,
     activeGameId: await getActiveGameId(id)
   };
 }
@@ -1003,11 +1031,11 @@ async function handleApi(req, res, url) {
     const user = await requireUser(req, res);
     if (!user) return;
     const activeGameId = await getActiveGameId(user.id);
-    const tc = queueByUser.get(Number(user.id)) || null;
+    const queued = await dbGet('SELECT time_control FROM queue WHERE user_id = ?', user.id);
     return sendJson(res, 200, {
       user: publicUser(user),
       activeGameId,
-      queue: tc ? queueStatus(user.id, tc) : null,
+      queue: queued ? await queueStatus(user.id, queued.time_control) : null,
       online: onlineCount()
     });
   }
@@ -1030,27 +1058,32 @@ async function handleApi(req, res, url) {
     const users = await dbGet('SELECT COUNT(*) AS c FROM users');
     const games = await dbGet("SELECT COUNT(*) AS c FROM games WHERE status != 'active'");
     const active = await dbGet("SELECT COUNT(*) AS c FROM games WHERE status = 'active'");
-    let queued = 0;
-    for (const q of queues.values()) queued += q.length;
+    const queued = await dbGet('SELECT COUNT(*) AS c FROM queue');
+    const online = await dbGet('SELECT COUNT(*) AS c FROM users WHERE last_seen >= ?', now() - 2 * 60_000);
     return sendJson(res, 200, {
       users: Number(users.c),
       games: Number(games.c),
       activeGames: Number(active.c),
-      online: onlineCount(),
-      queued
+      online: Number(online.c),
+      queued: Number(queued.c)
     });
   }
 
   if (pathname === '/api/online' && method === 'GET') {
-    const ids = [...sseClients.keys()].slice(0, 100);
-    const users = [];
-    for (const id of ids) {
-      const row = await dbGet('SELECT id, username, rating FROM users WHERE id = ?', id);
-      if (row) users.push({ id: Number(row.id), username: row.username, rating: Number(row.rating) });
-    }
+    // Reading the session refreshes last_seen so the lobby's live count stays accurate.
+    await getSessionUser(req).catch(() => null);
+    const rows = await dbAll(`
+      SELECT id, username, rating FROM users
+      WHERE last_seen >= ? ORDER BY last_seen DESC LIMIT 100
+    `, now() - 2 * 60_000);
+    const queueRows = await dbAll('SELECT time_control, COUNT(*) AS c FROM queue GROUP BY time_control');
     const timeControls = {};
-    for (const [tc, q] of queues.entries()) timeControls[tc] = q.length;
-    return sendJson(res, 200, { online: users, count: onlineCount(), queues: timeControls });
+    for (const row of queueRows) timeControls[row.time_control] = Number(row.c);
+    return sendJson(res, 200, {
+      online: rows.map(row => ({ id: Number(row.id), username: row.username, rating: Number(row.rating) })),
+      count: rows.length,
+      queues: timeControls
+    });
   }
 
   // ---- live events ----
@@ -1077,18 +1110,20 @@ async function handleApi(req, res, url) {
   if (pathname === '/api/online/cancel' && method === 'POST') {
     const user = await requireUser(req, res);
     if (!user) return;
-    removeFromQueue(user.id, true);
+    await removeFromQueue(user.id, true);
     return sendJson(res, 200, { ok: true });
   }
 
   if (pathname === '/api/online/status' && method === 'GET') {
     const user = await requireUser(req, res);
     if (!user) return;
+    const queued = await dbGet('SELECT time_control FROM queue WHERE user_id = ?', user.id);
+    if (queued) await tryMatch(queued.time_control);
     const activeGameId = await getActiveGameId(user.id);
-    const tc = queueByUser.get(Number(user.id)) || null;
+    const stillQueued = await dbGet('SELECT time_control FROM queue WHERE user_id = ?', user.id);
     return sendJson(res, 200, {
       activeGameId,
-      queue: tc ? queueStatus(user.id, tc) : null,
+      queue: stillQueued ? await queueStatus(user.id, stillQueued.time_control) : null,
       online: onlineCount()
     });
   }
@@ -1106,6 +1141,11 @@ async function handleApi(req, res, url) {
 
     if (method === 'GET' && !action) {
       const game = await getGame(gameId, true);
+      if (game) {
+        const opponentId = Number(row.white_id) === Number(user.id) ? Number(row.black_id) : Number(row.white_id);
+        const opponent = await dbGet('SELECT last_seen FROM users WHERE id = ?', opponentId);
+        game.opponentOnline = Boolean(opponent && now() - Number(opponent.last_seen) < 90_000);
+      }
       return sendJson(res, 200, { game: withServerNow(game) });
     }
 
@@ -1327,6 +1367,7 @@ function serveStatic(req, res, url) {
 // ---------------------------------------------------------------------------
 
 async function handleRequest(req, res) {
+  await ensureDb();
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   if (url.pathname.startsWith('/api/')) {
     if (req.method !== 'GET' && req.method !== 'HEAD' && !checkOrigin(req)) {
@@ -1343,38 +1384,65 @@ async function handleRequest(req, res) {
   res.end('Method not allowed');
 }
 
-const server = http.createServer((req, res) => {
+function requestListener(req, res) {
   handleRequest(req, res).catch(err => {
     console.error('Request failed:', err);
     if (!res.headersSent) sendError(res, err.status || 500, err.status ? err.message : 'Internal server error.');
     else { try { res.end(); } catch (e) {} }
   });
-});
+}
 
-// Authoritative clock checks. A game can end on time even if both clients are closed.
-let clockTickBusy = false;
-setInterval(async () => {
-  if (clockTickBusy) return;
-  clockTickBusy = true;
-  try {
-    const rows = await dbAll("SELECT id FROM games WHERE status = 'active'");
-    for (const row of rows) {
-      const game = await getGameRow(row.id);
-      if (game) await refreshGame(game);
+const server = http.createServer(requestListener);
+
+// Long-running timers only run in the traditional Node server. Serverless
+// deployments rely on client polling and the per-request clock refresh.
+let backgroundStarted = false;
+function startBackgroundJobs() {
+  if (backgroundStarted) return;
+  backgroundStarted = true;
+
+  // Heartbeat keeps proxies and browsers from dropping idle SSE streams.
+  setInterval(() => {
+    for (const set of sseClients.values()) {
+      for (const res of set) {
+        if (!res.writableEnded) res.write(': ping\n\n');
+      }
     }
-  } catch (e) {
-    console.error('Clock tick failed:', e.message);
-  } finally {
-    clockTickBusy = false;
-  }
-}, 1000).unref();
+  }, 15_000).unref();
 
-// Rating windows expand while players wait, so re-attempt every few seconds.
-setInterval(async () => {
-  for (const tc of [...queues.keys()]) {
-    try { await tryMatch(tc); } catch (e) { console.error('Matchmaking tick failed:', e.message); }
-  }
-}, 3000).unref();
+  // Expired session cleanup.
+  setInterval(() => {
+    dbRun('DELETE FROM sessions WHERE expires_at <= ?', now()).catch(() => {});
+  }, 60 * 60 * 1000).unref();
+
+  // Authoritative clock checks. A game can end on time even if both clients are closed.
+  let clockTickBusy = false;
+  setInterval(async () => {
+    if (clockTickBusy) return;
+    clockTickBusy = true;
+    try {
+      const rows = await dbAll("SELECT id FROM games WHERE status = 'active'");
+      for (const row of rows) {
+        const game = await getGameRow(row.id);
+        if (game) await refreshGame(game);
+      }
+    } catch (e) {
+      console.error('Clock tick failed:', e.message);
+    } finally {
+      clockTickBusy = false;
+    }
+  }, 1000).unref();
+
+  // Rating windows expand while players wait, so re-attempt every few seconds.
+  setInterval(async () => {
+    try {
+      const rows = await dbAll('SELECT DISTINCT time_control FROM queue');
+      for (const row of rows) await tryMatch(row.time_control);
+    } catch (e) {
+      console.error('Matchmaking tick failed:', e.message);
+    }
+  }, 3000).unref();
+}
 
 function localAddresses(port) {
   const os = require('node:os');
@@ -1391,7 +1459,8 @@ function localAddresses(port) {
 }
 
 async function start() {
-  await initDb();
+  await ensureDb();
+  startBackgroundJobs();
   server.listen(PORT, HOST, () => {
     console.log('');
     console.log('  \u265E  MarsChess is live');
@@ -1402,30 +1471,34 @@ async function start() {
   });
 }
 
-start().catch((err) => {
-  console.error('Failed to start MarsChess:', err);
-  process.exit(1);
-});
-
-server.on('error', (err) => {
-  console.error('Server error:', err.message);
-  process.exitCode = 1;
-});
-
-let closing = false;
-function shutdown() {
-  if (closing) return;
-  closing = true;
-  console.log('\nStopping MarsChess...');
-  for (const set of sseClients.values()) {
-    for (const res of set) {
-      try { res.end(); } catch (e) {}
-    }
-  }
-  server.close(() => {
-    closeDb().catch(() => {}).finally(() => process.exit(0));
+if (require.main === module) {
+  start().catch((err) => {
+    console.error('Failed to start MarsChess:', err);
+    process.exit(1);
   });
-  setTimeout(() => process.exit(0), 2500).unref();
+
+  server.on('error', (err) => {
+    console.error('Server error:', err.message);
+    process.exitCode = 1;
+  });
+
+  let closing = false;
+  const shutdown = () => {
+    if (closing) return;
+    closing = true;
+    console.log('\nStopping MarsChess...');
+    for (const set of sseClients.values()) {
+      for (const res of set) {
+        try { res.end(); } catch (e) {}
+      }
+    }
+    server.close(() => {
+      closeDb().catch(() => {}).finally(() => process.exit(0));
+    });
+    setTimeout(() => process.exit(0), 2500).unref();
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
 }
-process.on('SIGINT', shutdown);
-process.on('SIGTERM', shutdown);
+
+module.exports = { handleRequest, requestListener, ensureDb, server };

@@ -10,6 +10,9 @@
   state.online.zeroPollAt = 0;
   state.online.pollAt = 0;
   state.online.sseErrorAt = 0;
+  state.online.statusPollAt = 0;
+  state.online.statusPolling = false;
+  state.online.lobbyPollAt = 0;
   state.online.modalFor = null;
 
   // -------------------------------------------------------------------------
@@ -450,6 +453,7 @@
       state.online.resultShown = game.status !== 'active';
       state.online.submitting = false;
       state.online.flipped = myColor(game) === -1;
+      state.online.opponentOnline = Boolean(game.opponentOnline);
       state.online.zeroPollAt = 0;
       setGameClock(game);
       if (state.me) state.me.activeGameId = game.status === 'active' ? game.id : null;
@@ -670,6 +674,7 @@
     state.online.chat = chat || [];
     state.online.drawOffer = game.drawOfferBy ? game.drawOfferBy : null;
     state.online.submitting = false;
+    if (game.opponentOnline !== undefined) state.online.opponentOnline = Boolean(game.opponentOnline);
     state.online.zeroPollAt = 0;
     setGameClock(game);
 
@@ -725,97 +730,10 @@
   }
 
   MC.connectEvents = function () {
-    if (!state.user) return;
-    if (state.sse && state.sse.readyState !== EventSource.CLOSED) return;
-    if (state.sse) {
-      try { state.sse.close(); } catch (e) {}
-    }
-    const source = new EventSource('/api/events');
-    state.sse = source;
-    source.addEventListener('connected', event => {
-      const data = parseEvent(event);
-      if (data.user) {
-        state.user = Object.assign({}, state.user, data.user);
-        MC.updateNav();
-      }
-    });
-    source.addEventListener('online_count', event => {
-      const data = parseEvent(event);
-      updateOnlineCount(data.count);
-    });
-    source.addEventListener('queued', event => {
-      const data = parseEvent(event);
-      if (!data.queued) { state.online.queue = null; state.online.queueSince = 0; }
-      else {
-        state.online.queue = data;
-        state.online.queueSince = Date.now() - Number(data.elapsed || 0) * 1000;
-      }
-      if (state.route === 'online') refreshLobbyData();
-    });
-    source.addEventListener('queue_cancelled', () => {
-      state.online.queue = null;
-      state.online.queueSince = 0;
-      if (state.route === 'online') refreshLobbyData();
-    });
-    source.addEventListener('matched', event => {
-      const data = parseEvent(event);
-      if (!data.gameId) return;
-      state.online.queue = null;
-      state.online.queueSince = 0;
-      state.online.resultShown = false;
-      MC.toast('Opponent found. Game starting…', 'success');
-      MC.navigate('#game/' + data.gameId);
-    });
-    source.addEventListener('game', event => handleSseGame(parseEvent(event)));
-    source.addEventListener('game_over', event => handleSseGame(parseEvent(event)));
-    source.addEventListener('draw_offer', event => {
-      const data = parseEvent(event);
-      const game = state.online.game;
-      if (!game || Number(data.gameId) !== Number(game.id)) return;
-      game.drawOfferBy = data.from ? data.from.id : null;
-      state.online.drawOffer = data.from || null;
-      const banner = MC.byId('onlineDrawBanner');
-      if (banner) banner.innerHTML = drawBannerHtml(game);
-      if (data.from && state.user && Number(data.from.id) !== Number(state.user.id)) {
-        MC.toast('Your opponent offers a draw.', 'info');
-      }
-    });
-    source.addEventListener('draw_declined', event => {
-      const data = parseEvent(event);
-      const game = state.online.game;
-      if (!game || Number(data.gameId) !== Number(game.id)) return;
-      game.drawOfferBy = null;
-      state.online.drawOffer = null;
-      const banner = MC.byId('onlineDrawBanner');
-      if (banner) banner.innerHTML = '';
-      MC.toast('Draw offer declined.', 'info');
-    });
-    source.addEventListener('chat', event => {
-      const data = parseEvent(event);
-      if (!state.online.game || Number(data.gameId) !== Number(state.online.game.id)) return;
-      addChatMessage(data.message);
-    });
-    source.addEventListener('opponent_offline', event => {
-      const data = parseEvent(event);
-      if (state.route !== 'game' || !state.online.game || Number(data.gameId) !== Number(state.online.game.id)) return;
-      state.online.opponentOnline = false;
-      renderOnlineGame();
-      MC.toast('Your opponent disconnected. The clock is still running.', 'info', 4200);
-    });
-    source.addEventListener('opponent_online', event => {
-      const data = parseEvent(event);
-      if (state.route !== 'game' || !state.online.game || Number(data.gameId) !== Number(state.online.game.id)) return;
-      state.online.opponentOnline = true;
-      renderOnlineGame();
-      MC.toast('Your opponent is back online.', 'success');
-    });
-    source.onerror = () => {
-      if (!state.user) return;
-      if (Date.now() - (state.online.sseErrorAt || 0) > 12_000) {
-        state.online.sseErrorAt = Date.now();
-        MC.toast('Live connection interrupted. Reconnecting…', 'info', 2600);
-      }
-    };
+    // MarsChess uses short polling for live games. This keeps matchmaking and
+    // gameplay working on serverless hosts where long-lived SSE streams end
+    // as soon as the request handler returns.
+    if (state.user) state.online.connected = true;
   };
 
   MC.disconnectEvents = function () {
@@ -829,8 +747,54 @@
   // Clock and polling tick
   // -------------------------------------------------------------------------
 
+  async function pollQueueStatus() {
+    if (!state.user || !state.online.queue || state.online.statusPolling) return;
+    if (Date.now() - (state.online.statusPollAt || 0) < 2800) return;
+    state.online.statusPollAt = Date.now();
+    state.online.statusPolling = true;
+    try {
+      const data = await MC.api('/api/online/status');
+      if (data.activeGameId) {
+        state.online.queue = null;
+        state.online.queueSince = 0;
+        state.online.resultShown = false;
+        MC.toast('Opponent found. Game starting…', 'success');
+        MC.navigate('#game/' + data.activeGameId);
+        return;
+      }
+      if (data.queue) {
+        state.online.queue = data.queue;
+        state.online.queueSince = Date.now() - Number(data.queue.elapsed || 0) * 1000;
+      } else {
+        state.online.queue = null;
+        state.online.queueSince = 0;
+        if (state.route === 'online') await refreshLobbyData();
+      }
+    } catch (e) {
+      if (e.status === 401) {
+        state.user = null;
+        state.me = null;
+        state.online.queue = null;
+        MC.updateNav();
+      }
+    } finally {
+      state.online.statusPolling = false;
+    }
+  }
+
   function tickOnline() {
     updateQueueClockDom();
+    if (!state.user) return;
+
+    // Matchmaking, in-game state, chat and draw offers all arrive over short
+    // polling so they work both on a normal Node server and serverless hosting.
+    pollQueueStatus().catch(() => {});
+
+    if (state.route === 'online' && Date.now() - (state.online.lobbyPollAt || 0) > 12_000) {
+      state.online.lobbyPollAt = Date.now();
+      refreshLobbyData().catch(() => {});
+    }
+
     const game = state.online.game;
     if (!game || state.route !== 'game') return;
     if (game.status === 'active') {
@@ -844,7 +808,7 @@
           reloadCurrentGame();
         }
       }
-      if ((!state.sse || state.sse.readyState !== 1) && Date.now() - (state.online.pollAt || 0) > 4200) {
+      if (Date.now() - (state.online.pollAt || 0) > 2200) {
         state.online.pollAt = Date.now();
         reloadCurrentGame();
       }
