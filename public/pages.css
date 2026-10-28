@@ -119,7 +119,7 @@
 .level-chip { display: flex; align-items: center; gap: 9px; padding: 11px; border: 1px solid var(--border); border-radius: 10px; background: rgba(34, 27, 23, .72); min-width: 0; }
 .level-chip .lc-icon { display: grid; place-items: center; width: 31px; height: 31px; flex: 0 0 auto; border-radius: 8px; background: rgba(226, 96, 63, .11); color: var(--accent-bright); font-family: "Segoe UI Symbol", serif; font-size: 1.1rem; }
 .level-chip .lc-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: .78rem; font-weight: 750; }
-.level-chip .lc-rating { color: var(--faint); font-size: .67rem; }
+.level-chip .lc-rating { color: var(--faint); font-size: .67rem; white-space: nowrap; }
 
 .cta-band {
   position: relative;

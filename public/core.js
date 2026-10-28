@@ -505,8 +505,8 @@
         </div>`;
     } else {
       box.innerHTML = `
-        <a class="btn btn-ghost btn-sm" href="#auth">Sign in</a>
-        <a class="btn btn-primary btn-sm" href="#auth/register">Create account</a>`;
+        <a class="btn btn-ghost btn-sm nav-signin" href="#auth">Sign in</a>
+        <a class="btn btn-primary btn-sm nav-create" href="#auth/register"><span class="long">Create account</span><span class="short">Join</span></a>`;
     }
   };
 

@@ -262,6 +262,8 @@ img, svg { max-width: 100%; }
 }
 .account-menu a:hover, .account-menu button:hover { background: rgba(255, 255, 255, .06); color: #fff; }
 
+.nav-create .short { display: none; }
+
 .menu-btn {
   display: none;
   flex-direction: column;
@@ -1018,7 +1020,10 @@ textarea.input { resize: vertical; min-height: 78px; }
   body { font-size: 14px; }
   .view { padding: 18px 11px 36px; }
   .nav { padding: 0 11px; }
+  .nav-account { gap: 6px; }
   .nav-account .btn { min-height: 36px; padding: 7px 10px; font-size: .8rem; }
+  .nav-create .long { display: none; }
+  .nav-create .short { display: inline; }
   .player-card { min-height: 56px; padding: 7px 9px; gap: 8px; border-radius: 9px; }
   .player-avatar { width: 36px; height: 36px; border-radius: 8px; }
   .player-name { font-size: .84rem; }
@@ -1039,7 +1044,7 @@ textarea.input { resize: vertical; min-height: 78px; }
 @media (max-width: 380px) {
   .brand-word { font-size: 1rem; }
   .brand-planet { width: 30px; height: 30px; font-size: 18px; }
-  .nav-account .btn span.long { display: none; }
+  .nav-signin { display: none; }
   .clock { min-width: 59px; font-size: .98rem; }
   .player-captured { display: none; }
 }
